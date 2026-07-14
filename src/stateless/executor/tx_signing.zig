@@ -277,9 +277,9 @@ pub fn txHash(alloc: std.mem.Allocator, tx: *const input.TxInput, chain_id: u64)
     return rlp.keccak256(payload);
 }
 
-/// Recover the sender address from a signed transaction.
-/// Returns null if the signature is invalid or missing.
-pub fn recoverSender(alloc: std.mem.Allocator, tx: *const input.TxInput, chain_id: u64) !?input.Address {
+/// Recover the canonical uncompressed secp256k1 key bytes (X || Y) from a
+/// signed transaction. Returns null if the signature is invalid or missing.
+pub fn recoverPublicKey(alloc: std.mem.Allocator, tx: *const input.TxInput, chain_id: u64) !?[64]u8 {
     const r = tx.r orelse return null;
     const s = tx.s orelse return null;
     const v_val = tx.v orelse return null;
@@ -316,6 +316,13 @@ pub fn recoverSender(alloc: std.mem.Allocator, tx: *const input.TxInput, chain_i
 
     var pubkey: [64]u8 = undefined;
     if (!accel.ecrecover(&hash, &sig, recid, &pubkey)) return null;
+    return pubkey;
+}
+
+/// Recover the sender address from a signed transaction.
+/// Returns null if the signature is invalid or missing.
+pub fn recoverSender(alloc: std.mem.Allocator, tx: *const input.TxInput, chain_id: u64) !?input.Address {
+    const pubkey = try recoverPublicKey(alloc, tx, chain_id) orelse return null;
     var keccak_hash: [32]u8 = undefined;
     accel.keccak256(&pubkey, &keccak_hash);
     var address: [20]u8 = undefined;

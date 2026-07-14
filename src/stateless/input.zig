@@ -161,6 +161,15 @@ pub const ExecutionWitness = struct {
     headers: []const []const u8, // RLP ancestor block headers
 };
 
+/// EIP-8025 blob fee parameters carried by the Amsterdam SSZ chain config.
+/// They are metadata for this runtime today, but retaining them avoids a lossy
+/// projection at the SSZ production-adapter boundary.
+pub const BlobSchedule = struct {
+    target: u64,
+    max: u64,
+    base_fee_update_fraction: u64,
+};
+
 /// Witness with an explicit pre-state root and key list, used by the MPT
 /// proof verifier (mpt.verifyWitness) and unit tests.
 pub const StateWitness = struct {
@@ -185,6 +194,7 @@ pub const ChainConfig = struct {
     /// fork must be active for the target payload — payload block/timestamp >= these.
     activation_block: ?u64 = null,
     activation_timestamp: ?u64 = null,
+    blob_schedule: ?BlobSchedule = null,
 };
 
 /// Top-level input (matches Amsterdam spec StatelessInput).

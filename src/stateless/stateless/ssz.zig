@@ -13,6 +13,7 @@
 const std = @import("std");
 const input_mod = @import("input");
 const rlp_decode = @import("rlp_decode");
+const raw_ssz = @import("ssz_raw.zig");
 
 // ── Primitive reads (little-endian) ──────────────────────────────────────────
 
@@ -146,7 +147,7 @@ const EP_FIXED_SIZE: usize = 540;
 ///    [6..10]  offset → witness
 ///    [10..14] offset → chain_config (SszChainConfig: chain_id + SszForkConfig)
 ///    [14..18] offset → public_keys (packed ByteVector[65])
-pub fn decode(alloc: std.mem.Allocator, data: []const u8) !input_mod.StatelessInput {
+fn decodeLegacy(alloc: std.mem.Allocator, data: []const u8) !input_mod.StatelessInput {
     // Strip Ere's 4-byte LE length prefix when present. The first 4 bytes of
     // raw SSZ are always a small offset value, so matching against data.len-4
     // is unambiguous for any real payload.
@@ -396,4 +397,223 @@ pub fn decode(alloc: std.mem.Allocator, data: []const u8) !input_mod.StatelessIn
         },
         .public_keys = public_keys,
     };
+}
+
+/// Decode a complete Amsterdam V4 SSZ value without runtime projection, RLP
+/// conversion, or normalization. This is the semantic parser rooted by the
+/// RV64 measurement object and the host-only value differential adapter.
+pub fn decodeRaw(
+    alloc: std.mem.Allocator,
+    data: []const u8,
+) raw_ssz.DecodeError!raw_ssz.RawStatelessInput {
+    return raw_ssz.decode(alloc, data);
+}
+
+/// Decode a production runtime input. V4 always goes through the lossless raw
+/// parser first; V3 is retained only as explicitly detected legacy execution
+/// compatibility because no matching independent V3 oracle is pinned.
+pub fn decode(alloc: std.mem.Allocator, data: []const u8) !input_mod.StatelessInput {
+    const raw_value = decodeRaw(alloc, data) catch |err| {
+        if (looksLikeLegacyV3(data)) return decodeLegacy(alloc, data);
+        return err;
+    };
+    return adaptToRuntime(alloc, raw_value);
+}
+
+fn looksLikeLegacyV3(data: []const u8) bool {
+    const payload = legacyPayload(data) orelse return false;
+    if (payload.len < 2 or payload[0] != raw_ssz.schema_id[0] or payload[1] != raw_ssz.schema_id[1]) {
+        return false;
+    }
+    const body = payload[2..];
+    if (body.len < 16) return false;
+    const new_payload_offset = readU32At(body, 0) orelse return false;
+    const witness_offset = readU32At(body, 4) orelse return false;
+    if (new_payload_offset != 16 or new_payload_offset > witness_offset or witness_offset > body.len) {
+        return false;
+    }
+    const request = body[new_payload_offset..witness_offset];
+    if (request.len < 44) return false;
+    const payload_offset = readU32At(request, 0) orelse return false;
+    const hashes_offset = readU32At(request, 4) orelse return false;
+    if (payload_offset > hashes_offset or hashes_offset > request.len) return false;
+    const execution_payload = request[payload_offset..hashes_offset];
+    return execution_payload.len >= 440 and readU32At(execution_payload, 436) == 528;
+}
+
+fn legacyPayload(data: []const u8) ?[]const u8 {
+    if (data.len >= 2 and data[0] == raw_ssz.schema_id[0] and data[1] == raw_ssz.schema_id[1]) {
+        return data;
+    }
+    if (data.len >= 6 and readU32At(data, 0) == data.len - 4 and
+        data[4] == raw_ssz.schema_id[0] and data[5] == raw_ssz.schema_id[1])
+    {
+        return data[4..];
+    }
+    return null;
+}
+
+fn readU32At(data: []const u8, offset: usize) ?usize {
+    if (offset > data.len or data.len - offset < 4) return null;
+    return @intCast(std.mem.readInt(u32, data[offset..][0..4], .little));
+}
+
+fn adaptPublicKeys(
+    alloc: std.mem.Allocator,
+    raw_keys: []const [raw_ssz.PUBLIC_KEY_SIZE]u8,
+) ![]const []const u8 {
+    const runtime_keys = try alloc.alloc([]const u8, raw_keys.len);
+    for (raw_keys, 0..) |*key, index| runtime_keys[index] = key[0..];
+    return runtime_keys;
+}
+
+fn adaptToRuntime(
+    alloc: std.mem.Allocator,
+    raw_value: raw_ssz.RawStatelessInput,
+) !input_mod.StatelessInput {
+    const raw_request = raw_value.new_payload_request;
+    const raw_payload = raw_request.execution_payload;
+    if (raw_payload.base_fee_per_gas > std.math.maxInt(u64)) return error.BaseFeeOutOfRange;
+
+    const transactions = try alloc.alloc(input_mod.Transaction, raw_payload.transactions.len);
+    for (raw_payload.transactions, 0..) |transaction, index| {
+        transactions[index] = try rlp_decode.decodeSingleTx(alloc, transaction);
+    }
+
+    const withdrawals = try alloc.alloc(input_mod.Withdrawal, raw_payload.withdrawals.len);
+    for (raw_payload.withdrawals, 0..) |withdrawal, index| {
+        withdrawals[index] = .{
+            .index = withdrawal.index,
+            .validator_index = withdrawal.validator_index,
+            .address = withdrawal.address,
+            .amount = withdrawal.amount,
+        };
+    }
+
+    const public_keys = try adaptPublicKeys(alloc, raw_value.public_keys);
+
+    const raw_transactions: []const []const u8 = raw_payload.transactions;
+    const versioned_hashes: []const [32]u8 = raw_request.versioned_hashes;
+    const witness_state: []const []const u8 = raw_value.witness.state;
+    const witness_codes: []const []const u8 = raw_value.witness.codes;
+    const witness_headers: []const []const u8 = raw_value.witness.headers;
+
+    return .{
+        .new_payload_request = .{
+            .execution_payload = .{
+                .parent_hash = raw_payload.parent_hash,
+                .fee_recipient = raw_payload.fee_recipient,
+                .state_root = raw_payload.state_root,
+                .receipts_root = raw_payload.receipts_root,
+                .logs_bloom = raw_payload.logs_bloom,
+                .prev_randao = raw_payload.prev_randao,
+                .block_number = raw_payload.block_number,
+                .gas_limit = raw_payload.gas_limit,
+                .gas_used = raw_payload.gas_used,
+                .timestamp = raw_payload.timestamp,
+                .extra_data = try alloc.dupe(u8, raw_payload.extra_data),
+                .base_fee_per_gas = @intCast(raw_payload.base_fee_per_gas),
+                .block_hash = raw_payload.block_hash,
+                .transactions = transactions,
+                .raw_transactions = raw_transactions,
+                .withdrawals = withdrawals,
+                .blob_gas_used = raw_payload.blob_gas_used,
+                .excess_blob_gas = raw_payload.excess_blob_gas,
+                .slot_number = raw_payload.slot_number,
+                .block_access_list = try alloc.dupe(u8, raw_payload.block_access_list),
+            },
+            .parent_beacon_block_root = raw_request.parent_beacon_block_root,
+            .versioned_hashes = versioned_hashes,
+            .execution_requests = .{
+                .deposits = try encodeDepositRequests(alloc, raw_request.execution_requests.deposits),
+                .withdrawals = try encodeWithdrawalRequests(alloc, raw_request.execution_requests.withdrawals),
+                .consolidations = try encodeConsolidationRequests(alloc, raw_request.execution_requests.consolidations),
+            },
+        },
+        .witness = .{
+            .nodes = witness_state,
+            .codes = witness_codes,
+            .headers = witness_headers,
+        },
+        .chain_config = .{
+            .chain_id = raw_value.chain_config.chain_id,
+            .fork_name = forkNameFromIndex(raw_value.chain_config.active_fork.fork),
+            .active_fork_idx = raw_value.chain_config.active_fork.fork,
+            .activation_block = raw_value.chain_config.active_fork.activation.block_number,
+            .activation_timestamp = raw_value.chain_config.active_fork.activation.timestamp,
+            .blob_schedule = if (raw_value.chain_config.active_fork.blob_schedule) |schedule| .{
+                .target = schedule.target,
+                .max = schedule.max,
+                .base_fee_update_fraction = schedule.base_fee_update_fraction,
+            } else null,
+        },
+        .public_keys = public_keys,
+    };
+}
+
+fn encodeDepositRequests(
+    alloc: std.mem.Allocator,
+    requests: []const raw_ssz.RawDepositRequest,
+) ![]const u8 {
+    const record_size = 192;
+    const bytes = try alloc.alloc(u8, requests.len * record_size);
+    for (requests, 0..) |request, index| {
+        const offset = index * record_size;
+        @memcpy(bytes[offset..][0..48], request.pubkey[0..]);
+        @memcpy(bytes[offset + 48 ..][0..32], request.withdrawal_credentials[0..]);
+        std.mem.writeInt(u64, bytes[offset + 80 ..][0..8], request.amount, .little);
+        @memcpy(bytes[offset + 88 ..][0..96], request.signature[0..]);
+        std.mem.writeInt(u64, bytes[offset + 184 ..][0..8], request.index, .little);
+    }
+    return bytes;
+}
+
+fn encodeWithdrawalRequests(
+    alloc: std.mem.Allocator,
+    requests: []const raw_ssz.RawWithdrawalRequest,
+) ![]const u8 {
+    const record_size = 76;
+    const bytes = try alloc.alloc(u8, requests.len * record_size);
+    for (requests, 0..) |request, index| {
+        const offset = index * record_size;
+        @memcpy(bytes[offset..][0..20], request.source_address[0..]);
+        @memcpy(bytes[offset + 20 ..][0..48], request.validator_pubkey[0..]);
+        std.mem.writeInt(u64, bytes[offset + 68 ..][0..8], request.amount, .little);
+    }
+    return bytes;
+}
+
+fn encodeConsolidationRequests(
+    alloc: std.mem.Allocator,
+    requests: []const raw_ssz.RawConsolidationRequest,
+) ![]const u8 {
+    const record_size = 116;
+    const bytes = try alloc.alloc(u8, requests.len * record_size);
+    for (requests, 0..) |request, index| {
+        const offset = index * record_size;
+        @memcpy(bytes[offset..][0..20], request.source_address[0..]);
+        @memcpy(bytes[offset + 20 ..][0..48], request.source_pubkey[0..]);
+        @memcpy(bytes[offset + 68 ..][0..48], request.target_pubkey[0..]);
+    }
+    return bytes;
+}
+
+test "runtime public keys borrow raw key storage" {
+    const raw_keys = try std.testing.allocator.alloc([raw_ssz.PUBLIC_KEY_SIZE]u8, 2);
+    defer std.testing.allocator.free(raw_keys);
+    @memset(raw_keys[0][0..], 0x11);
+    @memset(raw_keys[1][0..], 0x22);
+    raw_keys[0][0] = 0x04;
+    raw_keys[1][0] = 0x04;
+
+    const runtime_keys = try adaptPublicKeys(std.testing.allocator, raw_keys);
+    defer std.testing.allocator.free(runtime_keys);
+
+    try std.testing.expectEqual(@intFromPtr(&raw_keys[0][0]), @intFromPtr(runtime_keys[0].ptr));
+    try std.testing.expectEqual(@intFromPtr(&raw_keys[1][0]), @intFromPtr(runtime_keys[1].ptr));
+
+    raw_keys[0][17] = 0xa5;
+    raw_keys[1][42] = 0x5a;
+    try std.testing.expectEqual(@as(u8, 0xa5), runtime_keys[0][17]);
+    try std.testing.expectEqual(@as(u8, 0x5a), runtime_keys[1][42]);
 }

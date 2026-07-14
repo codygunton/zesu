@@ -544,6 +544,7 @@ pub fn build(b: *std.Build) void {
         .{ .m = mods.handler, .name = "handler" },
         .{ .m = mods.mpt, .name = "mpt" },
         .{ .m = mods.rlp_decode, .name = "rlp_decode" },
+        .{ .m = mods.ssz_decode, .name = "ssz_decode" },
     }) |t| {
         const tst = b.addTest(.{ .root_module = t.m });
         _ = t.name;
@@ -614,6 +615,117 @@ pub fn build(b: *std.Build) void {
         const obj_step = b.step("rv64im-object", "Build relocatable rv64im ELF object (zesu.o)");
         const install_obj = b.addInstallFile(rv64_obj.getEmittedBin(), "lib/zesu.o");
         obj_step.dependOn(&install_obj.step);
+    }
+
+    // ── Lossless raw-SSZ measurement objects ─────────────────────────────────
+    //
+    // These deliberately remain three independently compiled RV64IM objects:
+    // the allocator owns heap mechanics, the parser exports an opaque raw
+    // result, and the sink imports its accessor. Do not link them with LTO when
+    // measuring parser complexity. The sink is only an anti-DCE/value-sensitivity
+    // adapter, never parser evidence.
+    //
+    // Build with: zig build rv64im-raw-ssz-object
+    {
+        const rv64im_target = b.resolveTargetQuery(.{
+            .cpu_arch = .riscv64,
+            .cpu_model = .{ .explicit = &std.Target.riscv.cpu.baseline_rv64 },
+            .cpu_features_add = std.Target.riscv.featureSet(&.{ .m, .zicclsm }),
+            .cpu_features_sub = std.Target.riscv.featureSet(&.{ .a, .c, .zca, .zcb, .d, .f, .zicsr, .zaamo, .zalrsc }),
+            .os_tag = .freestanding,
+            .abi = .none,
+        });
+
+        const raw_types = b.createModule(.{
+            .root_source_file = b.path("src/stateless/stateless/ssz_raw.zig"),
+            .target = rv64im_target,
+            .optimize = optimize,
+        });
+
+        const raw_allocator_module = b.createModule(.{
+            .root_source_file = b.path("src/zkvm/raw_allocator.zig"),
+            .target = rv64im_target,
+            .optimize = optimize,
+        });
+        const raw_allocator_object = b.addObject(.{
+            .name = "zesu_raw_ssz_allocator",
+            .root_module = raw_allocator_module,
+        });
+        raw_allocator_object.root_module.code_model = .medium;
+
+        const raw_decoder_module = b.createModule(.{
+            .root_source_file = b.path("src/zkvm/raw_decoder_root.zig"),
+            .target = rv64im_target,
+            .optimize = optimize,
+        });
+        raw_decoder_module.addImport("ssz_raw", raw_types);
+        const raw_decoder_object = b.addObject(.{
+            .name = "zesu_raw_ssz",
+            .root_module = raw_decoder_module,
+        });
+        raw_decoder_object.root_module.code_model = .medium;
+
+        const raw_sink_module = b.createModule(.{
+            .root_source_file = b.path("src/zkvm/raw_sink.zig"),
+            .target = rv64im_target,
+            .optimize = optimize,
+        });
+        raw_sink_module.addImport("ssz_raw", raw_types);
+        const raw_sink_object = b.addObject(.{
+            .name = "zesu_raw_ssz_sink",
+            .root_module = raw_sink_module,
+        });
+        raw_sink_object.root_module.code_model = .medium;
+
+        const raw_objects_step = b.step(
+            "rv64im-raw-ssz-object",
+            "Build separate rv64im raw-SSZ decoder and anti-DCE sink objects",
+        );
+        const install_allocator = b.addInstallFile(raw_allocator_object.getEmittedBin(), "lib/zesu_raw_ssz_allocator.o");
+        const install_decoder = b.addInstallFile(raw_decoder_object.getEmittedBin(), "lib/zesu_raw_ssz.o");
+        const install_sink = b.addInstallFile(raw_sink_object.getEmittedBin(), "lib/zesu_raw_ssz_sink.o");
+        raw_objects_step.dependOn(&install_allocator.step);
+        raw_objects_step.dependOn(&install_decoder.step);
+        raw_objects_step.dependOn(&install_sink.step);
+
+        // Convenience alias; the historical target above is retained for the
+        // existing extraction harness and Nix wiring.
+        const raw_objects_alias = b.step(
+            "rv64im-raw-objects",
+            "Alias for rv64im-raw-ssz-object",
+        );
+        raw_objects_alias.dependOn(raw_objects_step);
+    }
+
+    // ── Native full-value SSZ differential adapter ────────────────────────────
+    //
+    // This root intentionally imports only the lossless raw decoder. It is
+    // host-only formatting/IO for the three-way value differential and must not
+    // be linked into, or counted with, the freestanding RV64 decoder target.
+    // Build with: zig build zesu-ssz-value
+    {
+        const raw_types = b.createModule(.{
+            .root_source_file = b.path("src/stateless/stateless/ssz_raw.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        const value_root = b.createModule(.{
+            .root_source_file = b.path("src/stateless/stateless/ssz_value_main.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        value_root.addImport("ssz_raw", raw_types);
+
+        const value_exe = b.addExecutable(.{
+            .name = "zesu-ssz-value",
+            .root_module = value_root,
+        });
+        const value_step = b.step(
+            "zesu-ssz-value",
+            "Build the native host-only SSZ full-value differential adapter",
+        );
+        const install_value = b.addInstallArtifact(value_exe, .{});
+        value_step.dependOn(&install_value.step);
     }
 
     // ── Fixture fetch steps ───────────────────────────────────────────────────

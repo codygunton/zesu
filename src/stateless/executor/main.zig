@@ -21,6 +21,7 @@ const transition_mod = @import("./transition.zig");
 const output_mod = @import("./output.zig");
 const fork_mod = @import("hardfork");
 const tx_decode = @import("./tx_decode.zig");
+const tx_signing = @import("./tx_signing.zig");
 const types = @import("executor_types");
 const db_mod = @import("db");
 const context_mod = @import("context");
@@ -47,6 +48,24 @@ fn mapWithdrawals(alloc: std.mem.Allocator, withdrawals: []const input.Withdrawa
         out[i] = .{ .index = wd.index, .validator_index = wd.validator_index, .address = wd.address, .amount = wd.amount };
     }
     return out;
+}
+
+/// Stateless inputs carry one canonical SEC1 public key for each transaction.
+/// Verify the exact recovery result here, before the generic transition path may
+/// use the supplied keys as a sender-recovery optimization.
+fn validateStatelessPublicKeys(
+    alloc: std.mem.Allocator,
+    txs: []const types.TxInput,
+    public_keys: []const []const u8,
+    chain_id: u64,
+) !void {
+    if (public_keys.len != txs.len) return error.InvalidPublicKey;
+    for (public_keys, 0..) |public_key, index| {
+        if (public_key.len != 65 or public_key[0] != 0x04) return error.InvalidPublicKey;
+        const recovered_key = try tx_signing.recoverPublicKey(alloc, &txs[index], chain_id) orelse
+            return error.InvalidPublicKey;
+        if (!std.mem.eql(u8, public_key[1..], recovered_key[0..])) return error.InvalidPublicKey;
+    }
 }
 
 fn buildEnv(
@@ -392,6 +411,9 @@ pub fn executeBlockStateless(
     const env = buildEnv(req, block_hashes, try mapWithdrawals(alloc, ep.withdrawals), parent_header);
     try block_validation.validateBlock(env, spec);
     const txs = try tx_decode.decodeTxsFromInput(alloc, ep.transactions);
+    if (primitives.isEnabledIn(spec, .amsterdam)) {
+        try validateStatelessPublicKeys(alloc, txs, public_keys, chain_id);
+    }
 
     var ctx = context_mod.Context(db_mod.WitnessDatabase).new(
         try db_mod.WitnessDatabase.init(alloc, node_index, pre_state_root, witness_codes, block_hashes),
