@@ -622,6 +622,16 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         });
         decode_root.addImport("ssz_decode", obj_mods.ssz_decode);
+        decode_root.addImport("input", obj_mods.input);
+        decode_root.addImport("ssz_decode_observation", b.createModule(.{
+            .root_source_file = b.path("src/zkvm/ssz_decode_observation.zig"),
+            .target = rv64im_target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "input", .module = obj_mods.input },
+                .{ .name = "zkvm_io", .module = obj_mods.zkvm_io },
+            },
+        }));
         decode_root.addImport("zkvm_io", obj_mods.zkvm_io);
         decode_root.addImport("zesu_allocator", obj_mods.zesu_allocator);
         const decode_obj = b.addObject(.{ .name = "zesu-ssz-decode", .root_module = decode_root });
