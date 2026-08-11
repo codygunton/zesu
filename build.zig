@@ -371,7 +371,7 @@ fn addCryptoLibraries(
     step.root_module.addObjectFile(.{ .cwd_relative = blst });
     if (linux) {
         // mcl: link dynamically on Linux to avoid unresolved libstdc++ refs embedded in the .a.
-        step.root_module.addLibraryPath(.{ .cwd_relative = "/usr/local/lib" });
+        step.root_module.addLibraryPath(.{ .cwd_relative = std.fs.path.dirname(mcl).? });
         step.root_module.linkSystemLibrary("mcl", .{});
     } else {
         step.root_module.addObjectFile(.{ .cwd_relative = mcl });
