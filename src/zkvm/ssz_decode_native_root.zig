@@ -7,9 +7,7 @@ const zesu_allocator = @import("zesu_allocator");
 const zkvm_io = @import("zkvm_io");
 
 pub fn main() !void {
-    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .init;
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.heap.page_allocator;
     zesu_allocator.set(allocator);
     const encoded = try zkvm_io.read_input(allocator);
     const decoded = ssz_decode.decode(allocator, encoded) catch {
