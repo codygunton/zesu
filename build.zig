@@ -614,6 +614,21 @@ pub fn build(b: *std.Build) void {
         const obj_step = b.step("rv64im-object", "Build relocatable rv64im ELF object (zesu.o)");
         const install_obj = b.addInstallFile(rv64_obj.getEmittedBin(), "lib/zesu.o");
         obj_step.dependOn(&install_obj.step);
+
+        // Proof/evidence target: the same decoder graph with a root that stops after SSZ decode.
+        const decode_root = b.createModule(.{
+            .root_source_file = b.path("src/zkvm/ssz_decode_root.zig"),
+            .target = rv64im_target,
+            .optimize = optimize,
+        });
+        decode_root.addImport("ssz_decode", obj_mods.ssz_decode);
+        decode_root.addImport("zkvm_io", obj_mods.zkvm_io);
+        decode_root.addImport("zesu_allocator", obj_mods.zesu_allocator);
+        const decode_obj = b.addObject(.{ .name = "zesu-ssz-decode", .root_module = decode_root });
+        decode_obj.root_module.code_model = .medium;
+        const decode_step = b.step("rv64im-ssz-decode-object", "Build SSZ-decode-only rv64im object");
+        const install_decode = b.addInstallFile(decode_obj.getEmittedBin(), "lib/zesu-ssz-decode.o");
+        decode_step.dependOn(&install_decode.step);
     }
 
     // ── Fixture fetch steps ───────────────────────────────────────────────────
