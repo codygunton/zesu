@@ -440,6 +440,33 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(stateless_exe);
     addRunStep(b, "run", "Run the zesu app", stateless_exe, &.{});
 
+    // Native source oracle for the proof endpoint. It shares the decoder and observation modules
+    // with the production RV64 target but uses host stdin/stdout and the native allocator.
+    const decode_probe = b.addExecutable(.{
+        .name = "zesu-ssz-decode-probe",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/zkvm/ssz_decode_native_root.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    decode_probe.root_module.addImport("ssz_decode", mods.ssz_decode);
+    decode_probe.root_module.addImport("zesu_allocator", mods.zesu_allocator);
+    decode_probe.root_module.addImport("zkvm_io", mods.zkvm_io);
+    decode_probe.root_module.addImport("ssz_decode_observation", b.createModule(.{
+        .root_source_file = b.path("src/zkvm/ssz_decode_observation.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "input", .module = mods.input },
+            .{ .name = "zkvm_io", .module = mods.zkvm_io },
+        },
+    }));
+    addCryptoLibraries(decode_probe, target, crypto_include, libblst_path, libmcl_path, is_linux);
+    const decode_probe_step = b.step("ssz-decode-probe", "Build native SSZ decode source oracle");
+    const install_decode_probe = b.addInstallArtifact(decode_probe, .{});
+    decode_probe_step.dependOn(&install_decode_probe.step);
+
     // ── t8n: Ethereum State Transition Tool ───────────────────────────────────
     const t8n_input_module = b.createModule(.{
         .root_source_file = b.path("tools/t8n/input.zig"),
