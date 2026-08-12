@@ -4,12 +4,18 @@
 //! versioned, injective observation defined by `ssz_decode_observation`.
 
 const std = @import("std");
+const input = @import("input");
 const ssz_decode = @import("ssz_decode");
 const observation = @import("ssz_decode_observation");
 const zkvm_io = @import("zkvm_io");
 const zesu_allocator = @import("zesu_allocator");
 
 extern fn zkvm_exit(code: i32) noreturn;
+
+/// Keep the semantic decoder result construction inside one machine-level proof boundary.
+noinline fn decodeInput(alloc: std.mem.Allocator, encoded: []const u8) !input.StatelessInput {
+    return ssz_decode.decode(alloc, encoded);
+}
 
 pub fn panic(_: []const u8, _: ?*std.builtin.StackTrace, _: ?usize) noreturn {
     zkvm_exit(1);
@@ -20,7 +26,7 @@ export fn main() void {
     var input_size: usize = 0;
     zkvm_io.read_input(&input_ptr, &input_size);
 
-    const decoded = ssz_decode.decode(zesu_allocator.get(), input_ptr[0..input_size]) catch {
+    const decoded = decodeInput(zesu_allocator.get(), input_ptr[0..input_size]) catch {
         observation.writeFailure();
         zkvm_exit(0);
     };
